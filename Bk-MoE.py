@@ -98,8 +98,8 @@ if __name__ == "__main__":
     import time
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    x = torch.randn(4, 1024, 4096, device=device)
-    model = BlockRouter(4096, 4, topk=4).to(device)
+    x = torch.randn(4, 64, 128, device=device)
+    model = BlockRouter(128, 4, topk=4).to(device)
 
     start = time.time()
     out, aux_loss = model(x)

@@ -95,19 +95,26 @@ class RoPE(nn.Module):
         return x * cos + rotated * sin
 
 
-class Attention(nn.Module):
-    def __init__(self, D: int, L: int, dropout: float = 0.1):
+class BlockAttention(nn.Module):
+    def __init__(self, D: int, L: int, block_length: int, dropout: float = 0.1):
         super().__init__()
+        assert L % block_length == 0
+        self.L = L
         self.D = D
+        self.block_length = block_length
+        self.K = L // block_length
+
         self.Query = nn.Linear(D, D, bias=False)
         self.Key = nn.Linear(D, D, bias=False)
         self.Value = nn.Linear(D, D, bias=False)
+
+        self.transform = SwiGLU(D * block_length, D)
 
         self.norm1 = nn.RMSNorm(D)
         self.norm2 = nn.RMSNorm(D)
         self.ffn = SwiGLU(D)
         self.dropout = nn.Dropout(dropout)
-        mask = torch.tril(torch.ones(L, L))
+        mask = torch.tril(torch.ones(self.K, self.K))
         self.causal_mask = mask.masked_fill(mask == 0, float("-inf")).masked_fill(
             mask == 1, 0.0
         )
@@ -122,9 +129,18 @@ class Attention(nn.Module):
         V = self.Value(x)
         K, Q = rope(K, Q)
 
+        x = x.reshape(-1, self.K, self.block_length * self.D)
+        Q = Q.reshape(-1, self.K, self.block_length * self.D)
+        K = K.reshape(-1, self.K, self.block_length * self.D)
+        V = V.reshape(-1, self.K, self.block_length * self.D)
+
+        Q = self.transform(Q)
+        K = self.transform(K)
+        V = self.transform(V)
+
         attn = F.softmax(Q @ K.transpose(-1, -2) / (self.D**0.5) + mask, dim=-1) @ V
 
-        x = self.norm2(self.ffn(attn) + x)
+        x = self.norm2(self.ffn(attn) + self.transform(x))
         return self.dropout(x)
 
 
@@ -133,20 +149,25 @@ class BlockMoE(nn.Module):
         self,
         D: int,
         L: int,
+        block_length: int,
         n_block: int,
         dropout: float = 0.1,
         topk: int = 1,
     ):
         super().__init__()
         self.topk = topk
+        self.K = L // block_length
         self.n_block = n_block
         self.fx = SwiGLU(D, n_block)
-        self.blocks = nn.ModuleList([Attention(D, L, dropout) for _ in range(n_block)])
+        self.blocks = nn.ModuleList(
+            [BlockAttention(D, L, block_length, dropout) for _ in range(n_block)]
+        )
         self.norm = nn.RMSNorm(D)
         self.dropout = nn.Dropout(dropout)
         self.ffn = SwiGLU(D)
 
     def forward(self, x, rope: RoPE):
+        B, L, D = x.shape
         active = torch.sum(self.fx(x), dim=-2)  # [B, n_block]
         probs = F.softmax(active, dim=-1)  # [B, n_block]
         _, idxs = torch.topk(probs, self.topk, dim=-1)  # [B, topk]
@@ -156,7 +177,7 @@ class BlockMoE(nn.Module):
         target = torch.full_like(freq, self.topk / self.n_block)
         aux_loss = F.mse_loss(freq, target)
 
-        attn = torch.zeros_like(x)  # [B, L, D]
+        attn = torch.zeros([B, self.K, D], device=x.device)  # [B, L, D]
         unique_blocks = torch.unique(idxs)
         for j in unique_blocks:
             mask_j = (idxs == j).any(dim=1)  # [B] boolean
@@ -167,8 +188,7 @@ class BlockMoE(nn.Module):
             sub_attn = self.blocks[j](sub_x, rope)  # [num_j, L, D]
             attn[sample_indices] += sub_attn
 
-        x = x + self.ffn(attn)
-        x = self.norm(x)
+        x = self.norm(self.ffn(attn))
         x = self.dropout(x)
         return x, aux_loss
 
@@ -179,6 +199,7 @@ class Transformer(nn.Module):
         vocab_size: int,
         D: int,
         L: int,
+        block_length: int,
         n_layer: int,
         n_block: int,
         topk_block: int = 1,
@@ -188,7 +209,10 @@ class Transformer(nn.Module):
         self.n_layer = n_layer
         self.embedding = nn.Embedding(vocab_size, D)
         self.decoders = nn.ModuleList(
-            [BlockMoE(D, L, n_block, dropout, topk_block) for _ in range(n_layer)]
+            [
+                BlockMoE(D, L, block_length, n_block, dropout, topk_block)
+                for _ in range(n_layer)
+            ]
         )
         self.rope = RoPE(D, L)
         self.ffn = SwiGLU(D)
@@ -305,19 +329,19 @@ if __name__ == "__main__":
     import time
 
     B = 4
-    D, L = 128, 1000
-    block_len = 10
-    hidden_dim = 64
+    D, L = 128, 10000
+    block_len = 100
+    K = L // block_len
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    model = Transformer(6400, D, L, 1, 4, topk_block=1).to(device)
+    model = Transformer(6400, D, L, block_len, 1, 4, topk_block=1).to(device)
 
     model_size = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {model_size}")
 
     data = torch.randint(0, 6400, (B, L + 1), device=device)
     x = data[:, :-1]
-    y = data[:, 1:]
+    y = data[:, -K:]
 
     optimizer = MuSGD(model.parameters(), lr=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
@@ -344,6 +368,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pass
 
-    plt.title("Full-att Loss")
     plt.plot(losses)
     plt.show()

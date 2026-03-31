@@ -18,6 +18,30 @@ class SwiGLU(nn.Module):
         return self.out_proj(value * F.silu(gate))
 
 
+class LinearTransform(nn.Module):
+    def __init__(self, block_length: int, D: int):
+        super().__init__()
+        self.A = nn.Linear(D, D, bias=False)
+        self.B = nn.Parameter(torch.randn([D, block_length]))
+
+    def forward(self, x):
+        out = self.A(x)
+        out = torch.einsum("...ij,ji->...j", out, self.B)
+        return out
+
+
+class InvLinearTransform(nn.Module):
+    def __init__(self, block_length: int, D: int):
+        super().__init__()
+        self.A = nn.Linear(D, D, bias=False)
+        self.B = nn.Parameter(torch.randn(block_length, D))
+
+    def forward(self, x):
+        out = self.A(x)
+        out = torch.einsum("...i,ji->...ji", out, self.B)
+        return out
+
+
 class RoPE(nn.Module):
     """
     旋转位置嵌入 (Rotary Position Embedding)
@@ -95,36 +119,47 @@ class RoPE(nn.Module):
         return x * cos + rotated * sin
 
 
-class Attention(nn.Module):
-    def __init__(self, D: int, L: int, dropout: float = 0.1):
+class BlockAttention(nn.Module):
+    def __init__(
+        self, D: int, L: int, block_length: int, hidden_dim: int, dropout: float = 0.1
+    ):
         super().__init__()
+        assert L % block_length == 0
+        self.L = L
         self.D = D
-        self.Query = nn.Linear(D, D, bias=False)
-        self.Key = nn.Linear(D, D, bias=False)
-        self.Value = nn.Linear(D, D, bias=False)
+        self.block_length = block_length
+        self.K = L // block_length
+
+        self.Query = LinearTransform(block_length, D)
+        self.Key = LinearTransform(block_length, D)
+        self.Value = LinearTransform(block_length, D)
+        self.inv = InvLinearTransform(block_length, D)
 
         self.norm1 = nn.RMSNorm(D)
         self.norm2 = nn.RMSNorm(D)
         self.ffn = SwiGLU(D)
         self.dropout = nn.Dropout(dropout)
-        mask = torch.tril(torch.ones(L, L))
+        mask = torch.tril(torch.ones(self.K, self.K))
         self.causal_mask = mask.masked_fill(mask == 0, float("-inf")).masked_fill(
             mask == 1, 0.0
         )
 
     def forward(self, x, rope: RoPE):
-        mask = self.causal_mask.to(x.device, x.dtype)
-
+        mask = self.causal_mask.view(1, self.K, self.K, 1).to(x.device, x.dtype)
         x = self.norm1(x)
+        x = x.reshape(-1, self.K, self.block_length, self.D)
 
         Q = self.Query(x)
         K = self.Key(x)
         V = self.Value(x)
         K, Q = rope(K, Q)
 
-        attn = F.softmax(Q @ K.transpose(-1, -2) / (self.D**0.5) + mask, dim=-1) @ V
-
-        x = self.norm2(self.ffn(attn) + x)
+        attn = torch.einsum("...im,...jm->...ijm", Q, K) + mask
+        attn = F.softmax(attn, dim=-2)
+        out = torch.einsum("...ijm,...jm->...im", attn, V)
+        out = self.inv(out)
+        x = self.norm2(self.ffn(out) + x)
+        x = x.reshape(-1, self.L, self.D)
         return self.dropout(x)
 
 
@@ -133,6 +168,8 @@ class BlockMoE(nn.Module):
         self,
         D: int,
         L: int,
+        block_length: int,
+        hidden_dim: int,
         n_block: int,
         dropout: float = 0.1,
         topk: int = 1,
@@ -141,12 +178,19 @@ class BlockMoE(nn.Module):
         self.topk = topk
         self.n_block = n_block
         self.fx = SwiGLU(D, n_block)
-        self.blocks = nn.ModuleList([Attention(D, L, dropout) for _ in range(n_block)])
+        self.blocks = nn.ModuleList(
+            [
+                BlockAttention(D, L, block_length, hidden_dim, dropout)
+                for _ in range(n_block)
+            ]
+        )
         self.norm = nn.RMSNorm(D)
         self.dropout = nn.Dropout(dropout)
         self.ffn = SwiGLU(D)
 
     def forward(self, x, rope: RoPE):
+        B, L, D = x.shape
+
         active = torch.sum(self.fx(x), dim=-2)  # [B, n_block]
         probs = F.softmax(active, dim=-1)  # [B, n_block]
         _, idxs = torch.topk(probs, self.topk, dim=-1)  # [B, topk]
@@ -179,6 +223,8 @@ class Transformer(nn.Module):
         vocab_size: int,
         D: int,
         L: int,
+        block_length: int,
+        hidden_dim: int,
         n_layer: int,
         n_block: int,
         topk_block: int = 1,
@@ -188,9 +234,12 @@ class Transformer(nn.Module):
         self.n_layer = n_layer
         self.embedding = nn.Embedding(vocab_size, D)
         self.decoders = nn.ModuleList(
-            [BlockMoE(D, L, n_block, dropout, topk_block) for _ in range(n_layer)]
+            [
+                BlockMoE(D, L, block_length, hidden_dim, n_block, dropout, topk_block)
+                for _ in range(n_layer)
+            ]
         )
-        self.rope = RoPE(D, L)
+        self.rope = RoPE(D, L // block_length)
         self.ffn = SwiGLU(D)
         self.norm = nn.RMSNorm(D)
 
@@ -310,7 +359,9 @@ if __name__ == "__main__":
     hidden_dim = 64
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    model = Transformer(6400, D, L, 1, 4, topk_block=1).to(device)
+    model = Transformer(6400, D, L, block_len, hidden_dim, 1, 4, topk_block=1).to(
+        device
+    )
 
     model_size = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {model_size}")
@@ -343,7 +394,7 @@ if __name__ == "__main__":
             losses.append(loss.item())
     except KeyboardInterrupt:
         pass
-
-    plt.title("Full-att Loss")
+    
+    plt.title("Block-att Loss")
     plt.plot(losses)
     plt.show()

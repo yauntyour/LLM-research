@@ -95,19 +95,31 @@ class RoPE(nn.Module):
         return x * cos + rotated * sin
 
 
-class Attention(nn.Module):
-    def __init__(self, D: int, L: int, dropout: float = 0.1):
+class BlockAttention(nn.Module):
+    def __init__(
+        self,
+        D: int,
+        L: int,
+        block_length: int,
+        dropout: float = 0.1,
+    ):
         super().__init__()
+        assert L % block_length == 0
+        self.L = L
         self.D = D
+        self.block_length = block_length
+        self.K = L // block_length
+
         self.Query = nn.Linear(D, D, bias=False)
         self.Key = nn.Linear(D, D, bias=False)
         self.Value = nn.Linear(D, D, bias=False)
 
-        self.norm1 = nn.RMSNorm(D)
-        self.norm2 = nn.RMSNorm(D)
+        self.transform = SwiGLU(D * block_length, D)
         self.ffn = SwiGLU(D)
+        self.norm = nn.RMSNorm(D)
         self.dropout = nn.Dropout(dropout)
-        mask = torch.tril(torch.ones(L, L))
+
+        mask = torch.tril(torch.ones(self.K, self.K))
         self.causal_mask = mask.masked_fill(mask == 0, float("-inf")).masked_fill(
             mask == 1, 0.0
         )
@@ -115,62 +127,168 @@ class Attention(nn.Module):
     def forward(self, x, rope: RoPE):
         mask = self.causal_mask.to(x.device, x.dtype)
 
-        x = self.norm1(x)
-
         Q = self.Query(x)
         K = self.Key(x)
         V = self.Value(x)
         K, Q = rope(K, Q)
 
+        Q = Q.reshape(-1, self.K, self.block_length * self.D)
+        K = K.reshape(-1, self.K, self.block_length * self.D)
+        V = V.reshape(-1, self.K, self.block_length * self.D)
+
+        Q = self.transform(Q)
+        K = self.transform(K)
+        V = self.transform(V)
+
         attn = F.softmax(Q @ K.transpose(-1, -2) / (self.D**0.5) + mask, dim=-1) @ V
 
-        x = self.norm2(self.ffn(attn) + x)
-        return self.dropout(x)
+        attn = self.norm(attn)
+        attn = self.ffn(attn)
+        return self.dropout(attn)
 
 
-class BlockMoE(nn.Module):
-    def __init__(
-        self,
-        D: int,
-        L: int,
-        n_block: int,
-        dropout: float = 0.1,
-        topk: int = 1,
-    ):
+class KVQueryLayer(nn.Module):
+    def __init__(self, D: int, L: int, block_length: int):
         super().__init__()
-        self.topk = topk
-        self.n_block = n_block
-        self.fx = SwiGLU(D, n_block)
-        self.blocks = nn.ModuleList([Attention(D, L, dropout) for _ in range(n_block)])
-        self.norm = nn.RMSNorm(D)
-        self.dropout = nn.Dropout(dropout)
+        assert L % block_length == 0
+        self.Key = nn.Linear(D, L // block_length, bias=False)
+        self.Value = nn.Linear(D, D, bias=False)
+
+    def forward(self, x):
+        K = self.Key(x)  # [B, L, K]
+        V = self.Value(x)
+        return K.transpose(-1, -2) @ V, K
+
+
+class HyperConnection(nn.Module):
+    """
+    论文中的 Hyper-Connections (HC) 结构，包含三个可学习映射。
+    此处为简化版，聚焦于 mHC 的核心约束逻辑。
+    """
+
+    def __init__(self, dim, n=4, sinkhorn_iters=20):
+        """
+        Args:
+            dim: 模型维度 C (即单个流的维度)
+            n: 残差流扩展倍数
+            sinkhorn_iters: Sinkhorn-Knopp 迭代次数
+        """
+        super().__init__()
+        self.n = n
+        self.dim = dim
+        self.sinkhorn_iters = sinkhorn_iters
+
+        # 定义生成动态映射的线性投影 (对应论文公式7)
+        # 注意：输入是 flattened 后的 n*dim 维向量
+        self.proj_pre = nn.Linear(n * dim, n, bias=False)
+        self.proj_post = nn.Linear(n * dim, n, bias=False)
+        # 输出维度是 n*n，用于重塑为 H_res 矩阵
+        self.proj_res = nn.Linear(n * dim, n * n, bias=False)
+
+        # 可学习的门控因子和偏置 (对应论文公式7中的 alpha 和 b)
+        self.alpha_pre = nn.Parameter(torch.tensor(0.01))
+        self.alpha_post = nn.Parameter(torch.tensor(0.01))
+        self.alpha_res = nn.Parameter(torch.tensor(0.01))
+
+        self.bias_pre = nn.Parameter(torch.zeros(1, n))
+        self.bias_post = nn.Parameter(torch.zeros(1, n))
+        self.bias_res = nn.Parameter(torch.zeros(1, n, n))  # 重塑为 n*n
+
+        # 用于输入 x 的 RMSNorm，在 flattened 向量上操作
+        self.norm = nn.RMSNorm(n * dim)
+
+    def _sinkhorn_knopp(self, mat):
+        """Sinkhorn-Knopp 算法将矩阵投影到双随机矩阵流形"""
+        # 确保输入为正 (exp操作)
+        mat = torch.exp(mat)
+        for _ in range(self.sinkhorn_iters):
+            # 行归一化
+            mat = mat / mat.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            # 列归一化
+            mat = mat / mat.sum(dim=-2, keepdim=True).clamp(min=1e-8)
+        return mat
+
+    def forward(self, x):
+        # x 是残差流: [batch, seq_len, n, dim] 或类似形状
+        # 为了简化，假设输入 x 的形状为 [..., n, dim]
+        original_shape = x.shape
+        # 合并 batch 和 seq_len 维度，并 flatten 最后一个维度: [..., n*dim]
+        x_flat = x.reshape(-1, self.n * self.dim)
+
+        # 应用 RMSNorm (对应论文公式7)
+        x_norm = self.norm(x_flat)
+
+        # 计算动态部分 (对应论文公式7)
+        dyn_pre = self.proj_pre(x_norm)  # [..., n]
+        dyn_post = self.proj_post(x_norm)  # [..., n]
+        dyn_res = self.proj_res(x_norm)  # [..., n*n]
+
+        # 加入门控因子和偏置 (对应论文公式7和16)
+        # 注意：这里简化了除以norm的操作，论文中在kernel fusion里处理
+        h_pre_tilde = self.alpha_pre * dyn_pre + self.bias_pre
+        h_post_tilde = self.alpha_post * dyn_post + self.bias_post
+        h_res_tilde = self.alpha_res * dyn_res + self.bias_res.reshape(1, -1)
+
+        # 重塑 H_res 为矩阵形式: [..., n, n]
+        h_res_tilde = h_res_tilde.reshape(-1, self.n, self.n)
+
+        # ----- 核心 mHC 约束操作 (对应论文公式8) -----
+        # 1. 对 H_pre 和 H_post 应用 Sigmoid (非负约束)
+        H_pre = torch.sigmoid(h_pre_tilde)  # [..., n]
+        H_post = 2 * torch.sigmoid(h_post_tilde)  # [..., n]
+
+        # 2. 对 H_res 应用 Sinkhorn-Knopp (双随机约束)
+        # 处理 H_res 时，对每个位置的矩阵独立进行迭代
+        H_res = self._sinkhorn_knopp(h_res_tilde)  # [..., n, n]
+
+        # 将结果恢复为 (batch, seq_len) 的原始形状
+        batch_seq_len = original_shape[:-2]
+        H_pre = H_pre.reshape(*batch_seq_len, self.n)  # [..., n]
+        H_post = H_post.reshape(*batch_seq_len, self.n)  # [..., n]
+        H_res = H_res.reshape(*batch_seq_len, self.n, self.n)  # [..., n, n]
+
+        return H_pre, H_post, H_res
+
+
+class Chainward(nn.Module):
+    def __init__(self, D: int, n_HC: int = 4, exp: float = 2):
+        super().__init__()
+        self.d = D**0.5
+        self.Q = nn.Linear(D, D, bias=False)
+        self.K = nn.Linear(D, D, bias=False)
+        self.V = nn.Linear(D, D, bias=False)
+
+        # self.n_HC = n_HC
+        # self.hc = HyperConnection(n_HC, exp)
+        self.hcx = HyperConnection(D, n_HC)
+        self.hcy = HyperConnection(D, n_HC)
         self.ffn = SwiGLU(D)
+        self.norm = nn.RMSNorm(D)
 
-    def forward(self, x, rope: RoPE):
-        active = torch.sum(self.fx(x), dim=-2)  # [B, n_block]
-        probs = F.softmax(active, dim=-1)  # [B, n_block]
-        _, idxs = torch.topk(probs, self.topk, dim=-1)  # [B, topk]
+    def forward(self, x, y):
+        Hx_pre, Hx_post, Hx_res = self.hcx(x)
+        Hy_pre, Hy_post, Hy_res = self.hcy(y)
 
-        mask = torch.zeros_like(probs).scatter_(1, idxs, 1)  # [B, n_block]
-        freq = mask.mean(dim=0)  # [n_block]
-        target = torch.full_like(freq, self.topk / self.n_block)
-        aux_loss = F.mse_loss(freq, target)
+        x_pre = torch.einsum("...nd,...n->...d", x, Hx_pre)
+        y_per = torch.einsum("...nd,...n->...d", y, Hy_pre)
 
-        attn = torch.zeros_like(x)  # [B, L, D]
-        unique_blocks = torch.unique(idxs)
-        for j in unique_blocks:
-            mask_j = (idxs == j).any(dim=1)  # [B] boolean
-            if not mask_j.any():
-                continue
-            sample_indices = torch.where(mask_j)[0]  # [num_j]
-            sub_x = x[sample_indices]  # [num_j, L, D]
-            sub_attn = self.blocks[j](sub_x, rope)  # [num_j, L, D]
-            attn[sample_indices] += sub_attn
+        Q = self.Q(x_pre)
+        K = self.K(y_per)
+        V = self.V(y_per)
 
-        x = x + self.ffn(attn)
-        x = self.norm(x)
-        x = self.dropout(x)
-        return x, aux_loss
+        out = F.softmax(Q @ K.transpose(-1, -2) / self.d, dim=-1) @ V
+        out = x_pre + out + y_per
+        out = self.ffn(self.norm(out)) + out
+
+        x_post_contrib = Hx_post.unsqueeze(-1) * out.unsqueeze(-2)
+        y_post_contrib = Hy_post.unsqueeze(-1) * out.unsqueeze(-2)
+
+        x_res_contrib = torch.einsum("...ij,...jd->...id", Hx_res, x)
+        y_res_contrib = torch.einsum("...ij,...jd->...id", Hy_res, y)
+
+        new_out = x_post_contrib + y_post_contrib + x_res_contrib + y_res_contrib
+
+        return new_out
 
 
 class Transformer(nn.Module):
@@ -179,32 +297,39 @@ class Transformer(nn.Module):
         vocab_size: int,
         D: int,
         L: int,
+        block_length: int,
         n_layer: int,
-        n_block: int,
-        topk_block: int = 1,
         dropout: float = 0.1,
+        n_HC: int = 4,
+        exp: float = 2.0,
     ):
         super().__init__()
+        self.n_HC = n_HC
         self.n_layer = n_layer
         self.embedding = nn.Embedding(vocab_size, D)
-        self.decoders = nn.ModuleList(
-            [BlockMoE(D, L, n_block, dropout, topk_block) for _ in range(n_layer)]
-        )
         self.rope = RoPE(D, L)
-        self.ffn = SwiGLU(D)
+
+        self.decoders = nn.ModuleList(
+            [BlockAttention(D, L, block_length, dropout) for _ in range(n_layer)]
+        )
+
+        self.kvq = KVQueryLayer(D, L, block_length)
+        self.chainward = Chainward(D, n_HC, exp)
         self.norm = nn.RMSNorm(D)
 
     def forward(self, x):
         x = self.embedding(x)
-        aux_loss = 0
+        query, key = self.kvq(x)
+        query = query.unsqueeze(2).repeat(1, 1, self.n_HC, 1)
         for decoder in self.decoders:
-            x, ros_loss = decoder(x, self.rope)
-            aux_loss = aux_loss + ros_loss
-        aux_loss = aux_loss / self.n_layer
-        x = self.ffn(x)
-        x = self.norm(x)
-        out = x @ self.embedding.weight.t()
-        return out, aux_loss
+            att = decoder(x, self.rope)
+            att = att.unsqueeze(2).repeat(1, 1, self.n_HC, 1)
+            query = query + self.chainward(query, att)
+        query = query.sum(dim=2)
+        query = self.norm(key @ query)
+
+        query = query @ self.embedding.weight.T
+        return query
 
 
 class MuSGD(Optimizer):
@@ -304,13 +429,13 @@ class MuSGD(Optimizer):
 if __name__ == "__main__":
     import time
 
-    B = 4
-    D, L = 128, 1000
+    B = 1
+    D, L = 128, 300
     block_len = 10
-    hidden_dim = 64
+    K = L // block_len
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    model = Transformer(6400, D, L, 1, 4, topk_block=1).to(device)
+    model = Transformer(6400, D, L, block_len, 3, n_HC=4, exp=2).to(device)
 
     model_size = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {model_size}")
@@ -331,19 +456,28 @@ if __name__ == "__main__":
     try:
         for i in range(epochs):
             start = time.time()
-            out, aux_loss = model(x)
-            loss = F.cross_entropy(out_flatten(out), out_flatten(y)) + aux_loss
+            out = model(x)
+            loss = F.cross_entropy(out_flatten(out), out_flatten(y))
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             scheduler.step()
-            print(
-                f"Epoch: {i}, Loss: {loss.item() - aux_loss.item()}, cost time: {time.time() - start}s"
-            )
+            print(f"Epoch: {i}, Loss: {loss.item()}, lr: {optimizer.get_lr()[0]}")
             losses.append(loss.item())
+            if i % 100 == 0:
+                for name, param in model.named_parameters():
+                    if param.grad is not None:
+                        grad_cpu = param.grad.detach().cpu()
+                        print(
+                            f"Layer: {name:20} | Grad Norm: {grad_cpu.norm(2).item():.6e}"
+                        )
+                    else:
+                        print(
+                            f"Layer: {name:20} | Grad is NONE!"
+                        )  # 检查是否有层没参与计算
+                input("Press Enter to continue...")
     except KeyboardInterrupt:
         pass
 
-    plt.title("Full-att Loss")
     plt.plot(losses)
     plt.show()
