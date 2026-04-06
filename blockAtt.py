@@ -134,7 +134,6 @@ class BlockAttention(nn.Module):
 
         att = F.softmax(Q @ K.transpose(-1, -2) / (self.D**0.5) + mask, dim=-1)
         
-        att = 
 
         return self.dropout(x)
 
